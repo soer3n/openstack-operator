@@ -19,8 +19,10 @@ package core
 import (
 	"context"
 	"fmt"
+	"os"
 
 	certmgrv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	"github.com/go-logr/logr"
 	routev1 "github.com/openshift/api/route/v1"
 	cinderv1 "github.com/openstack-k8s-operators/cinder-operator/api/v1beta1"
 	glancev1 "github.com/openstack-k8s-operators/glance-operator/api/v1beta1"
@@ -32,32 +34,28 @@ import (
 	keystonev1 "github.com/openstack-k8s-operators/keystone-operator/api/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
-	corev1 "k8s.io/api/core/v1"
-
 	manilav1 "github.com/openstack-k8s-operators/manila-operator/api/v1beta1"
 	mariadbv1 "github.com/openstack-k8s-operators/mariadb-operator/api/v1beta1"
 	neutronv1 "github.com/openstack-k8s-operators/neutron-operator/api/v1beta1"
 	novav1 "github.com/openstack-k8s-operators/nova-operator/api/v1beta1"
 	octaviav1 "github.com/openstack-k8s-operators/octavia-operator/api/v1beta1"
-	clientv1 "github.com/openstack-k8s-operators/openstack-operator/apis/client/v1beta1"
-	corev1beta1 "github.com/openstack-k8s-operators/openstack-operator/apis/core/v1beta1"
-
-	"github.com/openstack-k8s-operators/openstack-operator/pkg/openstack"
-
 	ovnv1 "github.com/openstack-k8s-operators/ovn-operator/api/v1beta1"
 	placementv1 "github.com/openstack-k8s-operators/placement-operator/api/v1beta1"
 	swiftv1 "github.com/openstack-k8s-operators/swift-operator/api/v1beta1"
 	telemetryv1 "github.com/openstack-k8s-operators/telemetry-operator/api/v1beta1"
 	rabbitmqv2 "github.com/rabbitmq/cluster-operator/v2/api/v1beta1"
-
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/go-logr/logr"
-	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	clientv1 "github.com/openstack-k8s-operators/openstack-operator/apis/client/v1beta1"
+	corev1beta1 "github.com/openstack-k8s-operators/openstack-operator/apis/core/v1beta1"
+	"github.com/openstack-k8s-operators/openstack-operator/pkg/openstack"
 )
 
 // OpenStackControlPlaneReconciler reconciles a OpenStackControlPlane object
@@ -329,7 +327,7 @@ func (r *OpenStackControlPlaneReconciler) reconcileNormal(ctx context.Context, i
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *OpenStackControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&corev1beta1.OpenStackControlPlane{}).
 		Owns(&clientv1.OpenStackClient{}).
 		Owns(&corev1.Secret{}).
@@ -354,8 +352,14 @@ func (r *OpenStackControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) err
 		Owns(&telemetryv1.Ceilometer{}).
 		Owns(&redisv1.Redis{}).
 		Owns(&octaviav1.Octavia{}).
-		Owns(&routev1.Route{}).
 		Owns(&certmgrv1.Issuer{}).
-		Owns(&certmgrv1.Certificate{}).
-		Complete(r)
+		Owns(&certmgrv1.Certificate{})
+
+	if os.Getenv("OPENSHIFT_ROUTES_DISABLED") == "true" {
+		builder.Owns(&networkingv1.Ingress{})
+	} else {
+		builder.Owns(&routev1.Route{})
+	}
+
+	return builder.Complete(r)
 }

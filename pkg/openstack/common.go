@@ -3,6 +3,8 @@ package openstack
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	routev1 "github.com/openshift/api/route/v1"
@@ -14,16 +16,18 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
-	corev1 "github.com/openstack-k8s-operators/openstack-operator/apis/core/v1beta1"
-
 	k8s_corev1 "k8s.io/api/core/v1"
+	k8s_networkingv1 "k8s.io/api/networking/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	corev1 "github.com/openstack-k8s-operators/openstack-operator/apis/core/v1beta1"
 )
 
 // EnsureDeleted - Delete the object which in turn will clean the sub resources
@@ -115,6 +119,27 @@ func GetRoutesListWithLabel(
 	return routeList, nil
 }
 
+// GetIngressListWithLabel - Get all routes in namespace of the obj matching label selector
+func GetIngressListWithLabel(
+	ctx context.Context,
+	h *helper.Helper,
+	namespace string,
+	labelSelectorMap map[string]string,
+) (*k8s_networkingv1.IngressList, error) {
+	ingressList := &k8s_networkingv1.IngressList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(namespace),
+		client.MatchingLabels(labelSelectorMap),
+	}
+
+	if err := h.GetClient().List(ctx, ingressList, listOpts...); err != nil {
+		err = fmt.Errorf("Error listing ingresses for %s: %w", labelSelectorMap, err)
+		return nil, err
+	}
+
+	return ingressList, nil
+}
+
 // EnsureEndpointConfig -
 func EnsureEndpointConfig(
 	ctx context.Context,
@@ -167,7 +192,7 @@ func EnsureEndpointConfig(
 				}
 			}
 
-			ctrlResult, err := ed.ensureRoute(ctx, instance, helper, &svc, owner, condType)
+			ctrlResult, err := ed.ensureEndpoint(ctx, instance, helper, &svc, owner, condType)
 			if err != nil {
 				return svcOverrides, ctrlResult, err
 			} else if (ctrlResult != ctrl.Result{}) {
@@ -186,6 +211,137 @@ func EnsureEndpointConfig(
 	}
 
 	return svcOverrides, ctrl.Result{}, nil
+}
+
+func (ed *EndpointDetails) ensureEndpoint(
+	ctx context.Context,
+	instance *corev1.OpenStackControlPlane,
+	helper *helper.Helper,
+	svc *k8s_corev1.Service,
+	owner metav1.Object,
+	condType condition.Type,
+) (ctrl.Result, error) {
+	var ctrlResult reconcile.Result
+	var err error
+	if os.Getenv("OPENSHIFT_ROUTES_DISABLED") == "true" {
+		ctrlResult, err = ed.ensureIngress(ctx, instance, helper, svc, owner, condType)
+	} else {
+		ctrlResult, err = ed.ensureRoute(ctx, instance, helper, svc, owner, condType)
+	}
+	return ctrlResult, err
+}
+
+func (ed *EndpointDetails) ensureIngress(
+	ctx context.Context,
+	instance *corev1.OpenStackControlPlane,
+	helper *helper.Helper,
+	svc *k8s_corev1.Service,
+	owner metav1.Object,
+	condType condition.Type,
+) (ctrl.Result, error) {
+
+	// check if there is already an ingress with common.AppSelector from the service
+	if svcLabelVal, ok := svc.Labels[common.AppSelector]; ok {
+		ingresses, err := GetIngressListWithLabel(
+			ctx,
+			helper,
+			instance.Namespace,
+			map[string]string{common.AppSelector: svcLabelVal},
+		)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// check the ingresses if name changed where we are the owner
+		for _, i := range ingresses.Items {
+			instanceRef := metav1.OwnerReference{
+				APIVersion:         instance.APIVersion,
+				Kind:               instance.Kind,
+				Name:               instance.GetName(),
+				UID:                instance.GetUID(),
+				BlockOwnerDeletion: ptr.To(true),
+				Controller:         ptr.To(true),
+			}
+
+			owner := metav1.GetControllerOf(&i.ObjectMeta)
+
+			// Delete the ingress if the service was changed not to expose an ingress
+			if svc.ObjectMeta.Annotations[service.AnnotationIngressCreateKey] == "false" &&
+				// check if service name in ingress is equal to endpoint detail service name
+				IngressBackendEqualsServiceName(i, svc) &&
+				owner != nil && owner.UID == instance.GetUID() {
+
+				// Delete any other owner refs from ref list to not block deletion until owners are gone
+				i.SetOwnerReferences([]metav1.OwnerReference{instanceRef})
+
+				// Delete ingress
+				err := helper.GetClient().Delete(ctx, &i)
+				if err != nil && !k8s_errors.IsNotFound(err) {
+					err = fmt.Errorf("Error deleting route %s: %w", i.Name, err)
+					return ctrl.Result{}, err
+				}
+
+				if ed.Service.OverrideSpec.EndpointURL != nil {
+					ed.Service.OverrideSpec.EndpointURL = nil
+					helper.GetLogger().Info(fmt.Sprintf("Service %s override endpointURL removed", svc.Name))
+				}
+			}
+		}
+	}
+
+	// If the service has the create ingress annotation and its a default ClusterIP service -> create route
+	if svc.ObjectMeta.Annotations[service.AnnotationIngressCreateKey] == "true" && svc.Spec.Type == k8s_corev1.ServiceTypeClusterIP {
+		if instance.Status.Conditions.Get(condType) == nil {
+			instance.Status.Conditions.Set(condition.UnknownCondition(
+				condType,
+				condition.InitReason,
+				corev1.OpenStackControlPlaneExposeServiceReadyInitMessage,
+				owner.GetName(),
+				svc.Name,
+			))
+		}
+		if ed.Service.OverrideSpec.EmbeddedLabelsAnnotations == nil {
+			ed.Service.OverrideSpec.EmbeddedLabelsAnnotations = &service.EmbeddedLabelsAnnotations{}
+		}
+
+		if labelVal, ok := ed.Service.OverrideSpec.EmbeddedLabelsAnnotations.Labels[common.AppSelector]; ok {
+			ed.Labels = map[string]string{common.AppSelector: labelVal}
+		}
+
+		ctrlResult, err := ed.CreateIngress(ctx, helper, owner)
+		if err != nil {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				condType,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				corev1.OpenStackControlPlaneExposeServiceReadyErrorMessage,
+				owner.GetName(),
+				ed.Name,
+				err.Error()))
+
+			return ctrlResult, err
+		} else if (ctrlResult != ctrl.Result{}) {
+			return ctrlResult, nil
+		}
+
+		return ctrl.Result{}, nil
+	}
+	instance.Status.Conditions.Remove(condType)
+
+	return ctrl.Result{}, nil
+}
+
+func IngressBackendEqualsServiceName(ing k8s_networkingv1.Ingress, svc *k8s_corev1.Service) bool {
+
+	for _, rule := range ing.Spec.Rules {
+		for _, path := range rule.HTTP.Paths {
+			if path.Backend.Service.Name == svc.Name {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (ed *EndpointDetails) ensureRoute(
@@ -281,6 +437,68 @@ func (ed *EndpointDetails) ensureRoute(
 		return ctrl.Result{}, nil
 	}
 	instance.Status.Conditions.Remove(condType)
+
+	return ctrl.Result{}, nil
+}
+
+// CreateIngress -
+func (ed *EndpointDetails) CreateIngress(
+	ctx context.Context,
+	helper *helper.Helper,
+	owner metav1.Object,
+) (ctrl.Result, error) {
+
+	ingress := &k8s_networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        ed.Name,
+			Namespace:   ed.Namespace,
+			Labels:      ed.Labels,
+			Annotations: ed.Annotations,
+		},
+	}
+
+	if err := controllerutil.SetOwnerReference(owner, ingress, helper.GetScheme()); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	ingress.Spec = k8s_networkingv1.IngressSpec{
+		Rules: []k8s_networkingv1.IngressRule{
+			{
+				Host: *ed.Hostname,
+				IngressRuleValue: k8s_networkingv1.IngressRuleValue{
+					HTTP: &k8s_networkingv1.HTTPIngressRuleValue{
+						Paths: []k8s_networkingv1.HTTPIngressPath{
+							{
+								Path: ed.Route.Route.Spec.Path,
+								Backend: k8s_networkingv1.IngressBackend{
+									Service: &k8s_networkingv1.IngressServiceBackend{
+										Name: ed.Service.Spec.Name,
+										Port: k8s_networkingv1.ServiceBackendPort{
+											Number: ed.Route.Route.Spec.Port.TargetPort.IntVal,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if ed.TLS.Enabled {
+		// add tls config to ingress
+		ingress.Spec.TLS = []k8s_networkingv1.IngressTLS{
+			{
+				Hosts:      []string{*ed.Hostname},
+				SecretName: strings.ReplaceAll(*ed.Hostname, ".", "-") + "-tls",
+			},
+		}
+
+		// add cert-manager annotation for certificate creation
+		ingress.ObjectMeta.Annotations["cert-manager.io/issuer"] = ed.TLS.Issuer
+
+	}
 
 	return ctrl.Result{}, nil
 }
